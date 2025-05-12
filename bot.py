@@ -1,5 +1,5 @@
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -10,7 +10,10 @@ from flask import Flask, request
 load_dotenv()  # Load environment variables from .env
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("RENDER_EXTERNAL_URL")  # Set in Render env
+# Use RENDER_EXTERNAL_HOSTNAME or fallback to custom env var
+APP_URL = os.getenv("RENDER_EXTERNAL_HOSTNAME", os.getenv("RENDER_EXTERNAL_URL"))
+if APP_URL and not APP_URL.startswith("https://"):
+    APP_URL = f"https://{APP_URL}"
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -29,8 +32,12 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file_path = os.path.join(DOWNLOAD_DIR, doc.file_name)
-    file = await context.bot.get_file(doc.file_id)
-    await file.download_to_drive(file_path)
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        await file.download_to_drive(file_path)
+    except Exception as e:
+        await update.message.reply_text(f"Error downloading PDF: {e}")
+        return
 
     context.user_data["file_path"] = file_path
     context.user_data["file_name"] = doc.file_name
@@ -97,43 +104,49 @@ async def perform_rename(query_or_update, context: ContextTypes.DEFAULT_TYPE):
     new_name = f"{context.user_data['prefix']}{base_name}{context.user_data['suffix']}.pdf"
     old_path = context.user_data["file_path"]
     new_path = os.path.join(DOWNLOAD_DIR, new_name)
-    os.rename(old_path, new_path)
 
-    await query_or_update.message.reply_document(document=InputFile(new_path), filename=new_name)
-    await query_or_update.message.reply_text("Here is your renamed PDF.")
-
-    os.remove(new_path)
-    context.user_data.clear()
+    try:
+        os.rename(old_path, new_path)
+        with open(new_path, "rb") as f:
+            await query_or_update.message.reply_document(document=f, filename=new_name)
+        await query_or_update.message.reply_text("Here is your renamed PDF.")
+        os.remove(new_path)
+    except Exception as e:
+        await query_or_update.message.reply_text(f"Error processing PDF: {e}")
+    finally:
+        context.user_data.clear()
 
 # --- Webhook Setup for Render ---
 
 async def set_webhook(app):
-    await app.bot.set_webhook(url=f"{APP_URL}/webhook")
+    try:
+        await app.bot.set_webhook(url=f"{APP_URL}/webhook")
+        print(f"Webhook set to {APP_URL}/webhook")
+    except Exception as e:
+        print(f"Error setting webhook: {e}")
 
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
-    from telegram.ext._application import Application
-    application = flask_app.application
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    application.create_task(application.process_update(update))
+    update = Update.de_json(request.get_json(force=True), flask_app.application.bot)
+    flask_app.application.create_task(flask_app.application.process_update(update))
     return "ok"
 
 # --- Main Entrypoint ---
 
-def main():
+async def main():
     application = ApplicationBuilder().token(BOT_TOKEN).build()
-    flask_app.application = application  # Pass app instance to Flask
+    flask_app.application = application  # Attach application to Flask app
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000)),
-        webhook_url=f"{APP_URL}/webhook"
-    )
+    await set_webhook(application)  # Set webhook on startup
+    return application
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    loop = asyncio.get_event_loop()
+    application = loop.run_until_complete(main())
+    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
