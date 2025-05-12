@@ -242,6 +242,248 @@ async def conversation_timeout(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return FALLBACK
 
+# --- Missing Functions ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start command."""
+    await update.message.reply_text("Welcome! Upload a PDF to rename it.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /help command."""
+    await update.message.reply_text("Upload a PDF, then choose options to rename it. Use /start to begin.")
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors."""
+    logger.error(f"Update {update} caused error {context.error}")
+    if update.effective_chat:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⚠️ An error occurred. Please try again or contact support."
+        )
+
+async def unexpected_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle unexpected messages."""
+    await update.message.reply_text("⚠️ Unexpected input. Use /cancel to reset.")
+    return FALLBACK
+
+async def cancel_operation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the current operation."""
+    user_id = update.effective_user.id
+    pdf_data = get_pdf_data(context)
+    await safe_cleanup(pdf_data.get('file_path') if pdf_data else None, user_id, context)
+    if update.message:
+        await update.message.reply_text("Operation cancelled. Use /start to begin again.")
+    return FALLBACK
+
+async def update_status_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Update the status message with action buttons."""
+    pdf_data = get_pdf_data(context)
+    preview = generate_preview_filename(pdf_data)
+    keyboard = [
+        [InlineKeyboardButton("Add Prefix", callback_data="add_prefix"),
+         InlineKeyboardButton("Add Suffix", callback_data="add_suffix")],
+        [InlineKeyboardButton("Remove Text", callback_data="remove_name"),
+         InlineKeyboardButton("Replace Text", callback_data="replace_word")],
+        [InlineKeyboardButton("Change Case", callback_data="change_case"),
+         InlineKeyboardButton("Add Timestamp", callback_data="add_timestamp")],
+        [InlineKeyboardButton("Apply", callback_data="apply"),
+         InlineKeyboardButton("Reset", callback_data="reset"),
+         InlineKeyboardButton("Cancel", callback_data="cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if update.message:
+        await update.message.reply_text(
+            f"Current filename: `{preview}`\nChoose an action:",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(
+            f"Current filename: `{preview}`\nChoose an action:",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+def get_pdf_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Retrieve pdf_data from context."""
+    return context.user_data.get('pdf_data', {})
+
+def generate_preview_filename(pdf_data: dict) -> str:
+    """Generate a preview of the renamed filename."""
+    if not pdf_data:
+        return "Error: No PDF data"
+    name = pdf_data['original_name']
+    prefix = pdf_data.get('prefix', '')
+    suffix = pdf_data.get('suffix', '')
+    remove = pdf_data.get('remove', '')
+    replace = pdf_data.get('replace', {'old': '', 'new': ''})
+    case = pdf_data.get('case')
+    timestamp = pdf_data.get('timestamp', '')
+
+    # Apply transformations
+    if remove:
+        name = name.replace(remove, '')
+    if replace['old'] and replace['new']:
+        name = name.replace(replace['old'], replace['new'])
+    if case == 'upper':
+        name = name.upper()
+    elif case == 'lower':
+        name = name.lower()
+    elif case == 'title':
+        name = name.title()
+    name = f"{prefix}{name}{suffix}{timestamp}"
+    return sanitize_filename(name)
+
+async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle action selection from the inline keyboard."""
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+
+    if action == "add_prefix":
+        await query.edit_message_text("Enter the prefix to add:")
+        return AWAITING_PREFIX
+    elif action == "add_suffix":
+        await query.edit_message_text("Enter the suffix to add:")
+        return AWAITING_SUFFIX
+    elif action == "remove_name":
+        await query.edit_message_text("Enter the text to remove:")
+        return AWAITING_REMOVE
+    elif action == "replace_word":
+        await query.edit_message_text("Enter the text to replace:")
+        return AWAITING_REPLACE_OLD
+    elif action == "change_case":
+        keyboard = [
+            [InlineKeyboardButton("Uppercase", callback_data="case_upper"),
+             InlineKeyboardButton("Lowercase", callback_data="case_lower"),
+             InlineKeyboardButton("Title Case", callback_data="case_title")],
+            [InlineKeyboardButton("Back", callback_data="back_to_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("Select case option:", reply_markup=reply_markup)
+        return AWAITING_CASE
+    elif action == "add_timestamp":
+        keyboard = [
+            [InlineKeyboardButton("YYYYMMDD_HHMMSS", callback_data="ts_ymdhms"),
+             InlineKeyboardButton("YYYYMMDD", callback_data="ts_ymd"),
+             InlineKeyboardButton("DDMMYYYY", callback_data="ts_dmy")],
+            [InlineKeyboardButton("Back", callback_data="back_to_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("Select timestamp format:", reply_markup=reply_markup)
+        return AWAITING_TIMESTAMP
+    elif action == "apply":
+        return await apply_changes(update, context)
+    elif action == "reset":
+        pdf_data = get_pdf_data(context)
+        pdf_data.update({
+            'prefix': '', 'suffix': '', 'remove': '',
+            'replace': {'old': '', 'new': ''}, 'case': None,
+            'timestamp_format': None, 'timestamp': ''
+        })
+        context.user_data['pdf_data'] = pdf_data
+        await update_status_message(update, context)
+        return SELECTING_ACTION
+    elif action == "cancel":
+        return await cancel_operation(update, context)
+    return SELECTING_ACTION
+
+async def receive_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle prefix input."""
+    text = update.message.text
+    if not validate_input(text):
+        await update.message.reply_text("⚠️ Invalid prefix. Try again.")
+        return AWAITING_PREFIX
+    pdf_data = get_pdf_data(context)
+    pdf_data['prefix'] = text
+    context.user_data['pdf_data'] = pdf_data
+    await update_status_message(update, context)
+    return SELECTING_ACTION
+
+async def receive_suffix(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle suffix input."""
+    text = update.message.text
+    if not validate_input(text):
+        await update.message.reply_text("⚠️ Invalid suffix. Try again.")
+        return AWAITING_SUFFIX
+    pdf_data = get_pdf_data(context)
+    pdf_data['suffix'] = text
+    context.user_data['pdf_data'] = pdf_data
+    await update_status_message(update, context)
+    return SELECTING_ACTION
+
+async def receive_remove_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle text to remove."""
+    text = update.message.text
+    if not validate_input(text):
+        await update.message.reply_text("⚠️ Invalid text. Try again.")
+        return AWAITING_REMOVE
+    pdf_data = get_pdf_data(context)
+    pdf_data['remove'] = text
+    context.user_data['pdf_data'] = pdf_data
+    await update_status_message(update, context)
+    return SELECTING_ACTION
+
+async def receive_replace_old(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle text to replace (old)."""
+    text = update.message.text
+    if not validate_input(text):
+        await update.message.reply_text("⚠️ Invalid text. Try again.")
+        return AWAITING_REPLACE_OLD
+    pdf_data = get_pdf_data(context)
+    pdf_data['replace']['old'] = text
+    context.user_data['pdf_data'] = pdf_data
+    await update.message.reply_text("Enter the new text to replace with:")
+    return AWAITING_REPLACE_NEW
+
+async def receive_replace_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle replacement text (new)."""
+    text = update.message.text
+    if not validate_input(text):
+        await update.message.reply_text("⚠️ Invalid text. Try again.")
+        return AWAITING_REPLACE_NEW
+    pdf_data = get_pdf_data(context)
+    pdf_data['replace']['new'] = text
+    context.user_data['pdf_data'] = pdf_data
+    await update_status_message(update, context)
+    return SELECTING_ACTION
+
+async def receive_case_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle case change selection."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+    if choice == "back_to_menu":
+        await update_status_message(update, context)
+        return SELECTING_ACTION
+    pdf_data = get_pdf_data(context)
+    pdf_data['case'] = choice.split("_")[1]  # e.g., "case_upper" -> "upper"
+    context.user_data['pdf_data'] = pdf_data
+    await update_status_message(update, context)
+    return SELECTING_ACTION
+
+async def receive_timestamp_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle timestamp format selection."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+    if choice == "back_to_menu":
+        await update_status_message(update, context)
+        return SELECTING_ACTION
+    format_choice = choice.split("_")[1]  # e.g., "ts_ymdhms" -> "ymdhms"
+    timestamp = ""
+    if format_choice == "ymdhms":
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    elif format_choice == "ymd":
+        timestamp = datetime.now().strftime("%Y%m%d")
+    elif format_choice == "dmy":
+        timestamp = datetime.now().strftime("%d%m%Y")
+    pdf_data = get_pdf_data(context)
+    pdf_data['timestamp_format'] = format_choice
+    pdf_data['timestamp'] = f"_{timestamp}" if timestamp else ""
+    context.user_data['pdf_data'] = pdf_data
+    await update_status_message(update, context)
+    return SELECTING_ACTION
+
 # --- Main Bot Setup ---
 def main() -> None:
     """Initialize with enhanced handlers."""
@@ -278,7 +520,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(conv_handler)
-    application.add_error_handler(error_handler)
+    application.add_handler(error_handler)
 
     logger.info("Bot starting with enhanced reliability")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
