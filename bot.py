@@ -238,8 +238,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot."""
-    # Replace 'YOUR_BOT_TOKEN' with your actual bot token
-    app = ApplicationBuilder().token('YOUR_BOT_TOKEN').build()
+    # Get bot token from environment variable
+    bot_token = os.getenv('BOT_TOKEN')
+    if not bot_token:
+        raise ValueError("BOT_TOKEN environment variable not set")
+
+    app = ApplicationBuilder().token(bot_token).build()
 
     # Register handlers
     app.add_handler(CommandHandler("start", start))
