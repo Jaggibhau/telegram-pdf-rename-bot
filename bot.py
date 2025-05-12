@@ -7,13 +7,11 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters
 )
-from telegram.error import TelegramError, NetworkError, BadRequest
+from telegram.error import TelegramError, NetworkError
 import os
 import logging
 import traceback
 import re
-import shutil
-from PyPDF2 import PdfReader, PdfWriter  # Added for PDF compression
 
 # Configure logging with more detailed format
 logging.basicConfig(
@@ -25,7 +23,6 @@ logger = logging.getLogger(__name__)
 # Constants
 DOWNLOADS_DIR = "downloads"
 MAX_FILE_SIZE = 200 * 1024 * 1024  # 200 MB limit
-COMPRESSED_DIR = os.path.join(DOWNLOADS_DIR, "compressed")
 
 def sanitize_filename(filename: str) -> str:
     """Sanitize filename to prevent invalid characters or path traversal."""
@@ -41,27 +38,6 @@ async def safe_cleanup(file_path: str, user_id: int):
             logger.info(f"Cleaned up file for user {user_id}: {file_path}")
     except (OSError, PermissionError) as e:
         logger.error(f"Failed to clean up file {file_path} for user {user_id}: {str(e)}")
-
-def compress_pdf(input_path: str, output_path: str, user_id: int) -> bool:
-    """Compress PDF file using PyPDF2."""
-    try:
-        reader = PdfReader(input_path)
-        writer = PdfWriter()
-
-        for page in reader.pages:
-            writer.add_page(page)
-
-        # Enable compression
-        writer.compress = True
-
-        with open(output_path, 'wb') as output_file:
-            writer.write(output_file)
-
-        logger.info(f"Compressed PDF for user {user_id}: {output_path}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to compress PDF for user {user_id}: {str(e)}")
-        return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command with welcome message and instructions."""
@@ -107,7 +83,6 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_dir = os.path.join(DOWNLOADS_DIR, str(user_id))
         try:
             os.makedirs(user_dir, exist_ok=True)
-            os.makedirs(COMPRESSED_DIR, exist_ok=True)
         except (OSError, PermissionError) as e:
             logger.error(f"Failed to create directory {user_dir} for user {user_id}: {str(e)}")
             await update.message.reply_text("Server error creating storage directory. Please try again.")
@@ -143,8 +118,7 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'prefix': '',
                 'suffix': '',
                 'remove': '',
-                'replace': {'old': '', 'new': ''},
-                'compress': True  # Enable compression by default
+                'replace': {'old': '', 'new': ''}
             }
         except Exception as e:
             logger.error(f"Error storing metadata for user {user_id}: {str(e)}")
@@ -328,7 +302,7 @@ async def replace_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("An unexpected error occurred. Please try again.")
 
 async def apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /to command to apply renaming, compression, and send file."""
+    """Handle /to command to apply renaming and send file."""
     try:
         user_id = update.effective_user.id
         logger.info(f"User {user_id} used /to")
@@ -345,7 +319,6 @@ async def apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             suffix = pdf_data['suffix']
             remove_text = pdf_data['remove']
             replace_data = pdf_data['replace']
-            compress = pdf_data['compress']
         except KeyError as e:
             logger.error(f"Missing metadata key for user {user_id}: {str(e)}")
             await update.message.reply_text("Error accessing file metadata. Please upload the PDF again.")
@@ -387,51 +360,36 @@ async def apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Error generating new filename. Please try again.")
             return
 
-        # Handle compression
-        final_filepath = new_filepath
-        if compress:
-            compressed_filename = f"compressed_{new_filename}"
-            compressed_filepath = os.path.join(COMPRESSED_DIR, compressed_filename)
-            
-            if compress_pdf(file_path, compressed_filepath, user_id):
-                final_filepath = compressed_filepath
-                new_filename = compressed_filename
-            else:
-                logger.warning(f"Compression failed for user {user_id}, using original file")
-                # Continue with original file if compression fails
-
-        # Rename file if not compressed
-        if final_filepath == new_filepath:
-            try:
-                os.rename(file_path, new_filepath)
-                logger.info(f"File renamed for user {user_id}: {original_name} -> {new_filename}")
-            except (OSError, PermissionError) as e:
-                logger.error(f"Failed to rename file for user {user_id}: {str(e)}")
-                await update.message.reply_text("Server error renaming file. Please try again.")
-                return
+        # Rename file
+        try:
+            os.rename(file_path, new_filepath)
+            logger.info(f"File renamed for user {user_id}: {original_name} -> {new_filename}")
+        except (OSError, PermissionError) as e:
+            logger.error(f"Failed to rename file for user {user_id}: {str(e)}")
+            await update.message.reply_text("Server error renaming file. Please try again.")
+            return
 
         # Send file
         try:
-            with open(final_filepath, 'rb') as file:
+            with open(new_filepath, 'rb') as file:
                 await update.message.reply_document(
                     document=InputFile(file, filename=new_filename),
-                    caption=f"Renamed {'and compressed ' if compress else ''}PDF: {new_filename}"
+                    caption=f"Renamed PDF: {new_filename}"
                 )
         except (FileNotFoundError, PermissionError) as e:
             logger.error(f"Failed to read file for user {user_id}: {str(e)}")
-            await safe_cleanup(final_filepath, user_id)
+            await safe_cleanup(new_filepath, user_id)
             await update.message.reply_text("Error reading renamed file. Please try again.")
             return
         except TelegramError as e:
             logger.error(f"Telegram error sending file for user {user_id}: {str(e)}")
-            await safe_cleanup(final_filepath, user_id)
+            await safe_cleanup(new_filepath, user_id)
             await update.message.reply_text("Error sending renamed file. Please try again.")
             return
 
         # Cleanup
         try:
-            await safe_cleanup(file_path, user_id)
-            await safe_cleanup(final_filepath, user_id)
+            await safe_cleanup(new_filepath, user_id)
             context.user_data.clear()
             logger.info(f"Cleanup completed for user {user_id}")
         except Exception as e:
@@ -442,7 +400,7 @@ async def apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Telegram error in apply_changes for user {user_id}: {str(e)}")
         await update.message.reply_text("Telegram API error. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error inBLACK apply_changes for user {user_id}: {str(e)}\n{traceback.format_exc()}")
+        logger.error(f"Unexpected error in apply_changes for user {user_id}: {str(e)}\n{traceback.format_exc()}")
         await update.message.reply_text("An unexpected error occurred. Please try again.")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -496,7 +454,6 @@ def main():
 
         try:
             os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-            os.makedirs(COMPRESSED_DIR, exist_ok=True)
         except (OSError, PermissionError) as e:
             logger.error(f"Failed to create downloads directory: {str(e)}")
             raise RuntimeError("Cannot create downloads directory")
