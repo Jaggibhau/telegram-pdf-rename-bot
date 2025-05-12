@@ -242,7 +242,7 @@ async def conversation_timeout(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return FALLBACK
 
-# --- Missing Functions ---
+# --- Command and Utility Functions ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
     await update.message.reply_text("Welcome! Upload a PDF to rename it.")
@@ -515,15 +515,18 @@ def main() -> None:
             MessageHandler(filters.ALL, unexpected_message)
         ],
         conversation_timeout=600,  # 10 minutes
+        per_message=False,  # Explicitly set to False
+        per_callback=True,  # Ensure CallbackQueryHandler is tracked per callback
+        per_chat=True       # Ensure conversation state is per chat
     )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(conv_handler)
-    application.add_handler(error_handler)
+    application.add_error_handler(error_handler)  # Fixed: Use add_error_handler
 
     logger.info("Bot starting with enhanced reliability")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.all_types())
 
 if __name__ == '__main__':
     main()
