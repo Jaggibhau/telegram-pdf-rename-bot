@@ -33,8 +33,6 @@ DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR", "downloads")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", 200)) * 1024 * 1024
 MIN_DISK_SPACE = 2 * MAX_FILE_SIZE  # Require 2x file size as buffer
 TIMESTAMP_FORMAT = os.getenv("TIMESTAMP_FORMAT", "%Y%m%d_%H%M%S")
-if not os.path.exists(DOWNLOADS_DIR):
-    os.makedirs(DOWNLOADS_DIR)
 
 # Configure logging
 logging.basicConfig(
