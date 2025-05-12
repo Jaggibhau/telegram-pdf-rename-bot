@@ -1,13 +1,11 @@
 services:
-  - type: worker  # Changed from 'web' to 'worker'
+  - type: worker
     name: pdf-renamer-bot
-    env: python
+    runtime: python
+    repo: https://github.com/Jaggibhau/telegram-pdf-rename-bot
+    branch: main
     plan: free
-    region: oregon
+    env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    envVars:
-      - key: BOT_TOKEN
-        sync: false
-      - key: PYTHON_VERSION
-        value: 3.11
+    autoDeploy: true
