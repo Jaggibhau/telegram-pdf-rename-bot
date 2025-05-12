@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: worker  # Changed from 'web' to 'worker'
     name: pdf-renamer-bot
     env: python
     plan: free
