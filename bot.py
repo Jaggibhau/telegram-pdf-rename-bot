@@ -24,6 +24,10 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError, NetworkError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+# Suppress warnings
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="telegram.ext")
+
 # --- Configuration & Constants ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
@@ -50,12 +54,14 @@ FALLBACK = ConversationHandler.END
 # --- Enhanced Helper Functions ---
 def validate_input(text: str) -> bool:
     """Strict validation for user-provided text."""
-    if not text or len(text) > 100:
+    if not text or len(text) > 100 or len(text.strip()) == 0:
         return False
     return not bool(re.search(r'[<>:"/\\|?*\x00-\x1F]', text))
 
 def sanitize_filename(filename: str) -> str:
     """Nuclear-grade filename sanitization."""
+    if not filename:
+        return "unnamed.pdf"
     filename = re.sub(r'[<>:"/\\|?*\x00-\x1F]', '', filename)
     filename = filename.replace('..', '').strip(' .')
     return filename[:255] or "unnamed.pdf"  # Limit to 255 chars
@@ -64,8 +70,10 @@ def ensure_disk_space(required: int) -> bool:
     """Check if sufficient disk space exists."""
     try:
         stat = os.statvfs(DOWNLOADS_DIR)
-        return (stat.f_bavail * stat.f_frsize) >= required
-    except OSError:
+        available_space = stat.f_bavail * stat.f_frsize
+        return available_space >= required
+    except (OSError, AttributeError) as e:
+        logger.error(f"Failed to check disk space: {e}")
         return False
 
 async def safe_cleanup(file_path: Optional[str], user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -117,11 +125,12 @@ async def atomic_rename(src: str, dst: str) -> bool:
 # --- Enhanced PDF Handler ---
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Bulletproof PDF handling."""
-    user = update.effective_user
-    if not update.message or not update.message.document:
-        await update.message.reply_text("⚠️ Invalid file. Please send a PDF.")
+    if not update.effective_user or not update.message or not update.message.document:
+        if update.message:
+            await update.message.reply_text("⚠️ Invalid file. Please send a PDF.")
         return FALLBACK
 
+    user = update.effective_user
     document = update.message.document
     if document.mime_type != "application/pdf":
         await update.message.reply_text("❌ Only PDF files are accepted.")
@@ -139,7 +148,12 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     # Secure download
     user_dir = os.path.join(DOWNLOADS_DIR, str(user.id))
-    os.makedirs(user_dir, exist_ok=True)
+    try:
+        os.makedirs(user_dir, exist_ok=True)
+    except (OSError, PermissionError) as e:
+        logger.error(f"Failed to create user directory {user_dir}: {e}")
+        await update.message.reply_text("🚫 Server error creating directory. Try later.")
+        return FALLBACK
     
     original_name = sanitize_filename(document.file_name or "document.pdf")
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
@@ -178,6 +192,8 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Failure-resistant rename and send."""
     query = update.callback_query
+    if not query or not update.effective_chat:
+        return FALLBACK
     await query.answer("⏳ Processing...")
     user_id = update.effective_user.id
     pdf_data = get_pdf_data(context)
@@ -186,8 +202,8 @@ async def apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await query.edit_message_text("❌ Session expired. Upload again.")
         return FALLBACK
 
-    original_path = pdf_data['file_path']
-    if not os.path.exists(original_path):
+    original_path = pdf_data.get('file_path')
+    if not original_path or not os.path.exists(original_path):
         await query.edit_message_text("⚠️ File missing. Please re-upload.")
         await safe_cleanup(None, user_id, context)
         return FALLBACK
@@ -225,11 +241,10 @@ async def apply_changes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 # --- Timeout Recovery ---
 async def conversation_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle timeout with state preservation."""
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id if update.effective_user else None
     pdf_data = get_pdf_data(context)
     
-    if pdf_data:
-        # In a production system, save to Redis/DB here
+    if pdf_data and user_id:
         logger.info(f"Timeout: Preserving state for {user_id}")
 
     await safe_cleanup(pdf_data.get('file_path') if pdf_data else None, user_id, context)
@@ -245,38 +260,53 @@ async def conversation_timeout(update: Update, context: ContextTypes.DEFAULT_TYP
 # --- Command and Utility Functions ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
-    await update.message.reply_text("Welcome! Upload a PDF to rename it.")
+    if update.message:
+        await update.message.reply_text("Welcome! Upload a PDF to rename it.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command."""
-    await update.message.reply_text("Upload a PDF, then choose options to rename it. Use /start to begin.")
+    if update.message:
+        await update.message.reply_text("Upload a PDF, then choose options to rename it. Use /start to begin.")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors."""
     logger.error(f"Update {update} caused error {context.error}")
-    if update.effective_chat:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="⚠️ An error occurred. Please try again or contact support."
-        )
+    if not update or not update.effective_chat:
+        return
+    error_message = "⚠️ An error occurred. Please try again or contact support."
+    if isinstance(context.error, NetworkError):
+        error_message = "⚠️ Network issue. Please check your connection and try again."
+    elif isinstance(context.error, TelegramError):
+        error_message = f"⚠️ Telegram error: {context.error}. Please try again."
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=error_message
+    )
 
 async def unexpected_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle unexpected messages."""
-    await update.message.reply_text("⚠️ Unexpected input. Use /cancel to reset.")
+    if update.message:
+        await update.message.reply_text("⚠️ Unexpected input. Use /cancel to reset.")
     return FALLBACK
 
 async def cancel_operation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel the current operation."""
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id if update.effective_user else None
     pdf_data = get_pdf_data(context)
     await safe_cleanup(pdf_data.get('file_path') if pdf_data else None, user_id, context)
     if update.message:
         await update.message.reply_text("Operation cancelled. Use /start to begin again.")
+    elif update.callback_query:
+        await update.callback_query.edit_message_text("Operation cancelled. Use /start to begin again.")
     return FALLBACK
 
 async def update_status_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Update the status message with action buttons."""
     pdf_data = get_pdf_data(context)
+    if not pdf_data:
+        if update.message:
+            await update.message.reply_text("❌ Session expired. Upload a PDF again.")
+        return
     preview = generate_preview_filename(pdf_data)
     keyboard = [
         [InlineKeyboardButton("Add Prefix", callback_data="add_prefix"),
@@ -309,7 +339,7 @@ def get_pdf_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
 def generate_preview_filename(pdf_data: dict) -> str:
     """Generate a preview of the renamed filename."""
-    if not pdf_data:
+    if not pdf_data or 'original_name' not in pdf_data:
         return "Error: No PDF data"
     name = pdf_data['original_name']
     prefix = pdf_data.get('prefix', '')
@@ -336,6 +366,8 @@ def generate_preview_filename(pdf_data: dict) -> str:
 async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle action selection from the inline keyboard."""
     query = update.callback_query
+    if not query:
+        return FALLBACK
     await query.answer()
     action = query.data
 
@@ -375,12 +407,13 @@ async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return await apply_changes(update, context)
     elif action == "reset":
         pdf_data = get_pdf_data(context)
-        pdf_data.update({
-            'prefix': '', 'suffix': '', 'remove': '',
-            'replace': {'old': '', 'new': ''}, 'case': None,
-            'timestamp_format': None, 'timestamp': ''
-        })
-        context.user_data['pdf_data'] = pdf_data
+        if pdf_data:
+            pdf_data.update({
+                'prefix': '', 'suffix': '', 'remove': '',
+                'replace': {'old': '', 'new': ''}, 'case': None,
+                'timestamp_format': None, 'timestamp': ''
+            })
+            context.user_data['pdf_data'] = pdf_data
         await update_status_message(update, context)
         return SELECTING_ACTION
     elif action == "cancel":
@@ -389,81 +422,101 @@ async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def receive_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle prefix input."""
+    if not update.message or not update.message.text:
+        return AWAITING_PREFIX
     text = update.message.text
     if not validate_input(text):
         await update.message.reply_text("⚠️ Invalid prefix. Try again.")
         return AWAITING_PREFIX
     pdf_data = get_pdf_data(context)
-    pdf_data['prefix'] = text
-    context.user_data['pdf_data'] = pdf_data
+    if pdf_data:
+        pdf_data['prefix'] = text
+        context.user_data['pdf_data'] = pdf_data
     await update_status_message(update, context)
     return SELECTING_ACTION
 
 async def receive_suffix(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle suffix input."""
+    if not update.message or not update.message.text:
+        return AWAITING_SUFFIX
     text = update.message.text
     if not validate_input(text):
         await update.message.reply_text("⚠️ Invalid suffix. Try again.")
         return AWAITING_SUFFIX
     pdf_data = get_pdf_data(context)
-    pdf_data['suffix'] = text
-    context.user_data['pdf_data'] = pdf_data
+    if pdf_data:
+        pdf_data['suffix'] = text
+        context.user_data['pdf_data'] = pdf_data
     await update_status_message(update, context)
     return SELECTING_ACTION
 
 async def receive_remove_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle text to remove."""
+    if not update.message or not update.message.text:
+        return AWAITING_REMOVE
     text = update.message.text
     if not validate_input(text):
         await update.message.reply_text("⚠️ Invalid text. Try again.")
         return AWAITING_REMOVE
     pdf_data = get_pdf_data(context)
-    pdf_data['remove'] = text
-    context.user_data['pdf_data'] = pdf_data
+    if pdf_data:
+        pdf_data['remove'] = text
+        context.user_data['pdf_data'] = pdf_data
     await update_status_message(update, context)
     return SELECTING_ACTION
 
 async def receive_replace_old(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle text to replace (old)."""
+    if not update.message or not update.message.text:
+        return AWAITING_REPLACE_OLD
     text = update.message.text
     if not validate_input(text):
         await update.message.reply_text("⚠️ Invalid text. Try again.")
         return AWAITING_REPLACE_OLD
     pdf_data = get_pdf_data(context)
-    pdf_data['replace']['old'] = text
-    context.user_data['pdf_data'] = pdf_data
-    await update.message.reply_text("Enter the new text to replace with:")
+    if pdf_data:
+        pdf_data['replace']['old'] = text
+        context.user_data['pdf_data'] = pdf_data
+        await update.message.reply_text("Enter the new text to replace with:")
     return AWAITING_REPLACE_NEW
 
 async def receive_replace_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle replacement text (new)."""
+    if not update.message or not update.message.text:
+        return AWAITING_REPLACE_NEW
     text = update.message.text
     if not validate_input(text):
         await update.message.reply_text("⚠️ Invalid text. Try again.")
         return AWAITING_REPLACE_NEW
     pdf_data = get_pdf_data(context)
-    pdf_data['replace']['new'] = text
-    context.user_data['pdf_data'] = pdf_data
+    if pdf_data:
+        pdf_data['replace']['new'] = text
+        context.user_data['pdf_data'] = pdf_data
     await update_status_message(update, context)
     return SELECTING_ACTION
 
 async def receive_case_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle case change selection."""
     query = update.callback_query
+    if not query:
+        return SELECTING_ACTION
     await query.answer()
     choice = query.data
     if choice == "back_to_menu":
         await update_status_message(update, context)
         return SELECTING_ACTION
     pdf_data = get_pdf_data(context)
-    pdf_data['case'] = choice.split("_")[1]  # e.g., "case_upper" -> "upper"
-    context.user_data['pdf_data'] = pdf_data
+    if pdf_data:
+        pdf_data['case'] = choice.split("_")[1]  # e.g., "case_upper" -> "upper"
+        context.user_data['pdf_data'] = pdf_data
     await update_status_message(update, context)
     return SELECTING_ACTION
 
 async def receive_timestamp_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle timestamp format selection."""
     query = update.callback_query
+    if not query:
+        return SELECTING_ACTION
     await query.answer()
     choice = query.data
     if choice == "back_to_menu":
@@ -478,9 +531,10 @@ async def receive_timestamp_choice(update: Update, context: ContextTypes.DEFAULT
     elif format_choice == "dmy":
         timestamp = datetime.now().strftime("%d%m%Y")
     pdf_data = get_pdf_data(context)
-    pdf_data['timestamp_format'] = format_choice
-    pdf_data['timestamp'] = f"_{timestamp}" if timestamp else ""
-    context.user_data['pdf_data'] = pdf_data
+    if pdf_data:
+        pdf_data['timestamp_format'] = format_choice
+        pdf_data['timestamp'] = f"_{timestamp}" if timestamp else ""
+        context.user_data['pdf_data'] = pdf_data
     await update_status_message(update, context)
     return SELECTING_ACTION
 
@@ -515,15 +569,12 @@ def main() -> None:
             MessageHandler(filters.ALL, unexpected_message)
         ],
         conversation_timeout=600,  # 10 minutes
-        per_message=False,  # Explicitly set to False
-        per_callback=True,  # Ensure CallbackQueryHandler is tracked per callback
-        per_chat=True       # Ensure conversation state is per chat
     )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(conv_handler)
-    application.add_error_handler(error_handler)  # Fixed: Use add_error_handler
+    application.add_error_handler(error_handler)
 
     logger.info("Bot starting with enhanced reliability")
     application.run_polling(allowed_updates=Update.all_types())
