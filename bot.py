@@ -13,8 +13,8 @@ load_dotenv()
 # Get BOT_TOKEN
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Hardcode your Render service URL (replace with your actual URL)
-WEBHOOK_URL = "https://telegram-pdf-rename-bot.onrender.com/webhook"  # Replace with your Render URL
+# Hardcode your Render service webhook URL
+WEBHOOK_URL = "https://telegram-pdf-rename-bot.onrender.com/webhook"
 
 # Create downloads directory
 DOWNLOAD_DIR = "downloads"
@@ -26,6 +26,7 @@ flask_app.telegram_app = None
 
 # Log initial configuration
 print(f"DEBUG: BOT_TOKEN: {'set' if BOT_TOKEN else 'not set'}")
+print(f"DEBUG: BOT_TOKEN value: {BOT_TOKEN if BOT_TOKEN else 'None'}")
 print(f"DEBUG: WEBHOOK_URL: {WEBHOOK_URL}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -164,39 +165,49 @@ def webhook():
         return "error", 500
 
 def init_application():
-    print("DEBUG: Initializing application")
+    print("DEBUG: Starting initialization")
     if not BOT_TOKEN:
         print("ERROR: BOT_TOKEN is not set")
         return None
     if not WEBHOOK_URL:
         print("ERROR: WEBHOOK_URL is not set")
         return None
+    
+    print("DEBUG: Building Telegram application")
     try:
         application = ApplicationBuilder().token(BOT_TOKEN).build()
-        flask_app.telegram_app = application
-        print("DEBUG: Telegram application initialized")
-
-        # Add handlers
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
-        application.add_handler(CallbackQueryHandler(button_handler))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
-        # Set webhook
-        import asyncio
-        success = asyncio.run(set_webhook(application))
-        if not success:
-            print("WARNING: Webhook setup failed, please set manually using: "
-                  f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={WEBHOOK_URL}")
-        return application
+        print("DEBUG: Telegram application built successfully")
     except Exception as e:
-        print(f"ERROR initializing application: {e}")
+        print(f"ERROR building application: {e}")
         return None
+
+    flask_app.telegram_app = application
+    print("DEBUG: Telegram application assigned to flask_app")
+
+    # Add handlers
+    print("DEBUG: Adding handlers")
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    # Set webhook
+    print("DEBUG: Setting webhook")
+    import asyncio
+    success = asyncio.run(set_webhook(application))
+    if not success:
+        print("WARNING: Webhook setup failed, please set manually using: "
+              f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={WEBHOOK_URL}")
+    else:
+        print("DEBUG: Webhook setup completed")
+
+    return application
 
 if __name__ == "__main__":
     print("DEBUG: Starting Flask app")
     application = init_application()
     if application:
+        print("DEBUG: Flask app starting with initialized application")
         flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
     else:
         print("FATAL: Application initialization failed, Flask not started")
