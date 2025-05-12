@@ -5,7 +5,7 @@ from telegram.ext import (
 )
 import os
 
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "7790737352:AAFf8UBYIJDb4_VlM21Xsb5nyGJxxgvjX1I"
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
