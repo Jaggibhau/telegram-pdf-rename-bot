@@ -1,3 +1,5 @@
+if not os.path.exists(DOWNLOADS_DIR):
+    os.makedirs(DOWNLOADS_DIR)
 #!/usr/bin/env python
 # pylint: disable=logging-fstring-interpolation, C0116, W0613, W0719, R0912, R0915
 # Standard Library Imports
