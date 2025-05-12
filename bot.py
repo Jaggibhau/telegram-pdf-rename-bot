@@ -1,19 +1,27 @@
+import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
 )
-import os
+from dotenv import load_dotenv
+from flask import Flask, request
 
-BOT_TOKEN = "8096359703:AAGAp-_HRN-YJ1elIOJpyapb5LpJqj4Hg6c"
+load_dotenv()  # Load environment variables from .env
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+APP_URL = os.getenv("RENDER_EXTERNAL_URL")  # Set in Render env
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Start command
+# Flask app for Render
+flask_app = Flask(__name__)
+
+# --- Bot Handlers ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Send me a PDF to begin.")
 
-# When user sends PDF
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if doc.mime_type != "application/pdf":
@@ -21,7 +29,8 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file_path = os.path.join(DOWNLOAD_DIR, doc.file_name)
-    await context.bot.get_file(doc.file_id).download_to_drive(file_path)
+    file = await context.bot.get_file(doc.file_id)
+    await file.download_to_drive(file_path)
 
     context.user_data["file_path"] = file_path
     context.user_data["file_name"] = doc.file_name
@@ -35,33 +44,28 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ Remove Part", callback_data="remove_part"),
          InlineKeyboardButton("✅ Finish Rename", callback_data="rename_now")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(
         f"PDF received: {doc.file_name}\nChoose an option:",
-        reply_markup=reply_markup
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# Handle button clicks
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    action = query.data
+    context.user_data["action"] = action
 
-    data = query.data
-    context.user_data["action"] = data
+    if action == "rename_now":
+        await perform_rename(query, context)
+        return
 
     prompts = {
         "add_prefix": "Send the prefix you want to add.",
         "add_suffix": "Send the suffix you want to add.",
         "remove_part": "Send the part of the name you want to remove.",
     }
+    await query.message.reply_text(prompts[action])
 
-    if data == "rename_now":
-        await perform_rename(update, context)
-    else:
-        await query.message.reply_text(prompts[data])
-
-# When user replies with a prefix/suffix/word to remove
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "file_path" not in context.user_data or "action" not in context.user_data:
         return
@@ -77,38 +81,59 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Suffix '{text}' added.")
     elif action == "remove_part":
         context.user_data["remove"] = text
-        await update.message.reply_text(f"Part '{text}' will be removed from filename.")
+        await update.message.reply_text(f"Part '{text}' will be removed.")
 
-    del context.user_data["action"]
+    context.user_data.pop("action", None)
 
-# Final rename
-async def perform_rename(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+async def perform_rename(query_or_update, context: ContextTypes.DEFAULT_TYPE):
     if "file_path" not in context.user_data:
-        return await update_or_query.message.reply_text("Send a PDF first.")
+        await query_or_update.message.reply_text("Send a PDF first.")
+        return
 
     old_name = context.user_data["file_name"]
-    name_only = old_name.rsplit(".pdf", 1)[0]
-    name_only = name_only.replace(context.user_data["remove"], "")
-    new_name = f"{context.user_data['prefix']}{name_only}{context.user_data['suffix']}.pdf"
+    base_name = old_name.rsplit(".pdf", 1)[0]
+    base_name = base_name.replace(context.user_data.get("remove", ""), "")
 
+    new_name = f"{context.user_data['prefix']}{base_name}{context.user_data['suffix']}.pdf"
     old_path = context.user_data["file_path"]
     new_path = os.path.join(DOWNLOAD_DIR, new_name)
     os.rename(old_path, new_path)
 
-    await update_or_query.message.reply_document(document=InputFile(new_path), filename=new_name)
+    await query_or_update.message.reply_document(document=InputFile(new_path), filename=new_name)
+    await query_or_update.message.reply_text("Here is your renamed PDF.")
+
     os.remove(new_path)
     context.user_data.clear()
 
-    await update_or_query.message.reply_text("Here is your renamed PDF.")
+# --- Webhook Setup for Render ---
 
-# Main app
+async def set_webhook(app):
+    await app.bot.set_webhook(url=f"{APP_URL}/webhook")
+
+@flask_app.route("/webhook", methods=["POST"])
+def webhook():
+    from telegram.ext._application import Application
+    application = flask_app.application
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.create_task(application.process_update(update))
+    return "ok"
+
+# --- Main Entrypoint ---
+
+def main():
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    flask_app.application = application  # Pass app instance to Flask
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        webhook_url=f"{APP_URL}/webhook"
+    )
+
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
-
-    print("Bot running...")
-    app.run_polling()
+    main()
