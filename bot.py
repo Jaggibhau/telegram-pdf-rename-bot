@@ -1,5 +1,3 @@
-if not os.path.exists(DOWNLOADS_DIR):
-    os.makedirs(DOWNLOADS_DIR)
 #!/usr/bin/env python
 # pylint: disable=logging-fstring-interpolation, C0116, W0613, W0719, R0912, R0915
 # Standard Library Imports
@@ -35,6 +33,8 @@ DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR", "downloads")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", 200)) * 1024 * 1024
 MIN_DISK_SPACE = 2 * MAX_FILE_SIZE  # Require 2x file size as buffer
 TIMESTAMP_FORMAT = os.getenv("TIMESTAMP_FORMAT", "%Y%m%d_%H%M%S")
+if not os.path.exists(DOWNLOADS_DIR):
+    os.makedirs(DOWNLOADS_DIR)
 
 # Configure logging
 logging.basicConfig(
